@@ -1,23 +1,52 @@
 (function () {
   var API = '/api/wallpaper';
 
-  function applyWallpaper(url) {
-    var el = document.getElementById('custom-wallpaper-style');
-    if (!url) { if (el) el.remove(); return; }
+  var CACHE_KEY = 'custom-wallpaper-url';
+  var STYLE_ID = 'custom-wallpaper-style';
+
+  function readCache() {
+    try { return localStorage.getItem(CACHE_KEY); } catch (e) { return null; }
+  }
+  function writeCache(url) {
+    try { localStorage.setItem(CACHE_KEY, url || ''); } catch (e) {}
+  }
+
+  function setStyle(css) {
+    var el = document.getElementById(STYLE_ID);
+    if (!css) { if (el) el.remove(); return; }
     if (!el) {
       el = document.createElement('style');
-      el.id = 'custom-wallpaper-style';
+      el.id = STYLE_ID;
       document.head.appendChild(el);
     }
-    el.textContent = '.home-container{background-image:url("' + url + '")!important;' +
+    el.textContent = css;
+  }
+
+  function applyWallpaper(url) {
+    writeCache(url);
+    if (!url) { setStyle(''); return; }
+    setStyle('.home-container{background-image:url("' + url + '")!important;' +
       'background-size:cover!important;background-position:center!important;' +
-      'background-repeat:no-repeat!important;}';
+      'background-repeat:no-repeat!important;}');
+  }
+
+  // 脚本在 <head> 同步执行，首次绘制之前就要决定背景：
+  //  - 有本地缓存：立刻套用上次的壁纸（空字符串 = 默认图，不干预）
+  //  - 没有缓存（首次访问）：先隐藏默认背景，等接口返回后再显示，避免闪现原图
+  var cached = readCache();
+  if (cached === null) {
+    setStyle('.home-container{background-image:none!important;}');
+  } else if (cached) {
+    applyWallpaper(cached);
   }
 
   function load() {
-    fetch(API).then(function (r) { return r.json(); })
+    fetch(API, { cache: 'no-store' }).then(function (r) { return r.json(); })
       .then(function (d) { applyWallpaper(d.url || ''); })
-      .catch(function () {});
+      .catch(function () {
+        // 请求失败：若只是临时隐藏了默认背景，则恢复默认
+        if (readCache() === null) setStyle('');
+      });
   }
   load();
 
