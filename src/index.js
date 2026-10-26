@@ -310,7 +310,7 @@ async function getWp(c) {
 }
 const setWp = (c, v) => run(c, "INSERT INTO settings (key,value) VALUES ('wallpaper',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", JSON.stringify(v));
 const dropOld = async (c, w) => { if (w.file) await c.env.KV.delete(w.file); };
-app.get('/api/wallpaper', async c => c.json({ url: (await getWp(c)).url || '' }));
+app.get('/api/wallpaper', async c => { c.header('Cache-Control', 'no-store'); return c.json({ url: (await getWp(c)).url || '' }); });
 app.post('/api/wallpaper/url', auth, async c => {
   const url = String((await body(c)).url || '').trim();
   if (!/^https?:\/\//i.test(url) || /["'()\\\s<>]/.test(url)) return c.json({ error: 'URL 无效（需 http/https 开头，且不能含空格、引号、括号）' }, 400);
