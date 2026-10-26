@@ -1,0 +1,11 @@
+{
+  "name": "nav-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler pages dev public --d1=DB --kv=KV --compatibility-date=2025-09-01",
+    "deploy": "wrangler pages deploy public --project-name=cl-nav"
+  },
+  "dependencies": { "bcryptjs": "^3.0.2", "hono": "^4.6.0" },
+  "devDependencies": { "wrangler": "^4.60.0" }
+}
