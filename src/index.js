@@ -33,6 +33,9 @@ let ready = null;
 function ensure(env) {
   if (!ready) {
     ready = (async () => {
+      // 已初始化过就直接跳过建表（避免每个冷启动实例都跑一遍 11 条 DDL，导致首个请求很慢）
+      const done = await env.DB.prepare("SELECT 1 AS x FROM settings WHERE key='seeded'").first().catch(() => null);
+      if (done) return;
       await env.DB.batch(SCHEMA.map(s => env.DB.prepare(s)));
       if (!(await env.DB.prepare("SELECT 1 AS x FROM settings WHERE key='seeded'").first())) {
         if (!(await env.DB.prepare('SELECT COUNT(*) AS n FROM menus').first()).n)
@@ -110,6 +113,17 @@ async function unlockTokens(c) {
   return out;
 }
 const isUnlocked = (ps, kind, id, hash) => !hash || ps.some(p => p.kind === kind && Number(p.id) === Number(id) && p.ph === hash);
+
+// 管理员（带有效登录 token 且显式 ?admin=1）可查看加密分类下的卡片，用于后台管理
+async function isAdminReq(c) {
+  if (c.req.query('admin') !== '1') return false;
+  const h = c.req.header('Authorization') || '';
+  if (!h.startsWith('Bearer ')) return false;
+  try {
+    const p = await verify(h.slice(7), await jwtSecret(c), 'HS256');
+    return !(p.kind || p.typ);
+  } catch (e) { return false; }
+}
 
 const pub = r => { const { password_hash, ...s } = r; return { ...s, has_password: !!password_hash }; };
 async function list(c, table, order = '', map = x => x) {
@@ -218,7 +232,8 @@ app.delete('/api/menus/submenus/:id', auth, async c =>
 // ---------- 卡片 ----------
 app.get('/api/cards/:menuId', async c => {
   const { subMenuId } = c.req.query();
-  const tokens = await unlockTokens(c);
+  const admin = await isAdminReq(c);
+  const tokens = admin ? [] : await unlockTokens(c);
   const locked = () => c.json({ error: '该分类需要密码验证', locked: true }, 403);
   const send = async (sql, id) => {
     const rows = await all(c, sql, id);
@@ -229,12 +244,12 @@ app.get('/api/cards/:menuId', async c => {
     if (!/^\d+$/.test(String(subMenuId))) return c.json({ error: '参数不正确' }, 400);
     const row = await first(c, 'SELECT s.id, s.parent_id, s.password_hash AS sub_hash, m.password_hash AS menu_hash FROM sub_menus s LEFT JOIN menus m ON m.id = s.parent_id WHERE s.id=?', Number(subMenuId));
     if (!row) return c.json({ error: '分类不存在' }, 404);
-    if (!isUnlocked(tokens, 'menu', row.parent_id, row.menu_hash) || !isUnlocked(tokens, 'submenu', row.id, row.sub_hash)) return locked();
+    if (!admin && (!isUnlocked(tokens, 'menu', row.parent_id, row.menu_hash) || !isUnlocked(tokens, 'submenu', row.id, row.sub_hash))) return locked();
     return send('SELECT * FROM cards WHERE sub_menu_id=? ORDER BY "order"', row.id);
   }
   const row = await first(c, 'SELECT id, password_hash FROM menus WHERE id=?', Number(c.req.param('menuId')));
   if (!row) return c.json({ error: '分类不存在' }, 404);
-  if (!isUnlocked(tokens, 'menu', row.id, row.password_hash)) return locked();
+  if (!admin && !isUnlocked(tokens, 'menu', row.id, row.password_hash)) return locked();
   return send('SELECT * FROM cards WHERE menu_id=? AND sub_menu_id IS NULL ORDER BY "order"', row.id);
 });
 app.post('/api/cards', auth, async c => {
