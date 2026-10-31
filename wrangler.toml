@@ -10,10 +10,10 @@ bucket = "./dist"
 [[d1_databases]]
 binding = "DB" # 项目代码中读取数据库的变量名（如 env.DB）
 database_name = "cl-nav-db" # 你在 Cloudflare 创建的 D1 数据库名称
-database_id = "cde22656-1515-43e1-bdd4-106bf353a851" # 在 Cloudflare D1 控制台可以找到
+database_id = "9b02bbc5-a1e3-450a-9c16-7fef718c0e27" # 在 Cloudflare D1 控制台可以找到
 
 # 绑定 Cloudflare KV 命名空间
 [[kv_namespaces]]
 binding = "KV" # 项目代码中读取 KV 的变量名（如 env.KV）
-id = "5929a93d6e0c4451a5425e2e3bb628d5" # 在 Cloudflare KV 控制台可以找到
+id = "447fc44bb7044f0aa18d0b5a90a5a51c" # 在 Cloudflare KV 控制台可以找到
 
