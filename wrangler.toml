@@ -16,3 +16,4 @@ database_id = "你的数据库ID_UUID" # 在 Cloudflare D1 控制台可以找到
 [[kv_namespaces]]
 binding = "KV" # 项目代码中读取 KV 的变量名（如 env.KV）
 id = "你的KV命名空间ID" # 在 Cloudflare KV 控制台可以找到
+
