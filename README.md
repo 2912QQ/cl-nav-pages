@@ -9,4 +9,3 @@
    在 Variables and Secrets 里设置 ADMIN_PASSWORD（必填），ADMIN_USERNAME 和 JWT_SECRET 按需设置。
    
   重新部署（Retry deployment），然后访问 /api/health，确认 kvBound 和 adminPasswordSet 都是 true，再去 /admin 登录。
-  
