@@ -1,4 +1,4 @@
-name = "cl-nav-pages"
+name = "cl-nav-pages-a123 "
 compatibility_date = "2025-09-01"
 keep_vars = true
 
@@ -9,10 +9,10 @@ bucket = "./dist"
 # 绑定 Cloudflare D1 数据库
 [[d1_databases]]
 binding = "DB" # 项目代码中读取数据库的变量名（如 env.DB）
-database_name = "cl-nav-db" # 你在 Cloudflare 创建的 D1 数据库名称
-database_id = "你的数据库ID_UUID" # 在 Cloudflare D1 控制台可以找到
+database_name = "daohang-cl-nav" # 你在 Cloudflare 创建的 D1 数据库名称
+database_id = "22f64d14-7c97-4b8f-8372-6dd30d4c2188" # 在 Cloudflare D1 控制台可以找到
 
 # 绑定 Cloudflare KV 命名空间
 [[kv_namespaces]]
 binding = "KV" # 项目代码中读取 KV 的变量名（如 env.KV）
-id = "你的KV命名空间ID" # 在 Cloudflare KV 控制台可以找到
+id = "6f79ae3317cb4a98952c4075585eb7c7" # 在 Cloudflare KV 控制台可以找到

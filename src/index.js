@@ -310,6 +310,8 @@ app.post('/api/upload', auth, async c => {
   return r.error ? c.json({ error: r.error }, 400) : c.json({ filename: r.key, url: '/uploads/' + r.key });
 });
 app.get('/uploads/:name', async c => {
+  const nm = c.req.param('name');
+  if (nm.includes('/') || nm.startsWith('__')) return c.notFound(); // 备份存档不对外公开
   const { value, metadata } = await c.env.KV.getWithMetadata(c.req.param('name'), 'arrayBuffer');
   if (!value) return c.notFound();
   return new Response(value, {
@@ -345,6 +347,32 @@ app.delete('/api/wallpaper', auth, async c => {
   await dropOld(c, await getWp(c));
   await setWp(c, { url: '', file: '' });
   return c.json({ url: '' });
+});
+
+// ---------- 页脚版权（文字 + 链接，可在后台自定义） ----------
+const FOOTER_DEFAULT = { text: 'Copyright © 2026  |   ', link_text: '龍哥博客', url: 'https://bk0.at8.ccwu.cc/' };
+const cleanFooter = v => {
+  v = v && typeof v === 'object' ? v : {};
+  const text = String(v.text == null ? '' : v.text).slice(0, 200);
+  const link_text = String(v.link_text == null ? '' : v.link_text).trim().slice(0, 100);
+  const url = String(v.url == null ? '' : v.url).trim();
+  if (url && (!/^https?:\/\//i.test(url) || url.length > 500 || /[\s"'<>\\]/.test(url))) return { error: '链接 URL 无效（需 http:// 或 https:// 开头，且不能含空格、引号、尖括号）' };
+  return { text, link_text, url };
+};
+async function getFooter(c) {
+  try { const r = await first(c, "SELECT value FROM settings WHERE key='footer'"); if (r && r.value) { const f = cleanFooter(JSON.parse(r.value)); if (!f.error) return f; } } catch (e) {}
+  return { ...FOOTER_DEFAULT };
+}
+app.get('/api/footer', async c => { c.header('Cache-Control', 'no-store'); return c.json(await getFooter(c)); });
+app.put('/api/footer', auth, async c => {
+  const f = cleanFooter(await body(c));
+  if (f.error) return c.json({ error: f.error }, 400);
+  await run(c, "INSERT INTO settings (key,value) VALUES ('footer',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", JSON.stringify(f));
+  return c.json(f);
+});
+app.delete('/api/footer', auth, async c => {
+  await run(c, "DELETE FROM settings WHERE key='footer'");
+  return c.json({ ...FOOTER_DEFAULT });
 });
 
 // ---------- 书签导入导出 ----------
@@ -498,6 +526,450 @@ app.post('/api/bookmarks/import', auth, async c => {
   if (!menus.length) return c.json({ error: '没有识别到任何书签' }, 400);
   try { return c.json({ success: true, ...(await importTree(c, menus)) }); }
   catch (e) { return c.json({ error: '导入失败：' + e.message }, 500); }
+});
+
+// ================= 备份 / 恢复：本地下载 · WebDAV · 站内存档(KV) · 自动备份 =================
+// 说明：Cloudflare Pages 没有内置定时器，自动备份采用「到点后的第一次访问触发」+ 可选的外部 Cron 地址（/api/backup/cron）。
+// 备份内容：栏目、子栏目、卡片、广告、友链、壁纸设置（含栏目密码哈希）；不含用户账号。可选打包 KV 里的图片。
+const BJ = 8 * 3600e3, DAY = 86400e3, KVP = '__backup__/';
+const NAME_RE = /^nav-backup-[0-9A-Za-z-]{1,40}\.json$/;
+const pad = x => String(x).padStart(2, '0');
+const bjDate = ts => new Date(ts + BJ);
+const stampOf = ts => { const d = bjDate(ts); return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}-${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`; };
+const bytesB64 = buf => { const u = buf instanceof Uint8Array ? buf : new Uint8Array(buf); let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); };
+const toInt = v => { if (v == null || v === '') return null; const x = Number(v); return Number.isSafeInteger(x) ? x : null; };
+const str = (v, len) => (typeof v === 'string' && v.length <= len ? v : null);
+const putSetting = (c, k, v) => run(c, 'INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', k, v);
+const drain = r => { try { if (r.body) r.body.cancel().catch(() => {}); } catch (e) {} };
+
+// ---------- 配置 / 状态（存放在 settings 表） ----------
+const DEF_CFG = () => ({
+  webdav: { url: '', username: '', password: '', dir: 'nav-backup' },
+  auto: { enabled: false, mode: 'daily', intervalHours: 24, time: '03:00', weekday: 1, targets: ['kv'], includeImages: false, keep: 7 },
+  cron_token: ''
+});
+async function getCfg(c) {
+  let s = {};
+  try { s = JSON.parse((await first(c, "SELECT value FROM settings WHERE key='backup_config'")).value) || {}; } catch (e) {}
+  const d = DEF_CFG();
+  return { webdav: { ...d.webdav, ...s.webdav }, auto: { ...d.auto, ...s.auto }, cron_token: s.cron_token || '' };
+}
+const saveCfg = (c, v) => putSetting(c, 'backup_config', JSON.stringify(v));
+async function getState(c) {
+  try { return JSON.parse((await first(c, "SELECT value FROM settings WHERE key='backup_state'")).value) || {}; } catch (e) { return {}; }
+}
+const saveState = (c, v) => putSetting(c, 'backup_state', JSON.stringify(v));
+async function pushHist(c, entry) {
+  const st = await getState(c);
+  st.history = [{ t: Date.now(), ...entry }, ...(st.history || [])].slice(0, 15);
+  await saveState(c, st);
+}
+
+// WebDAV 密码加密保存（AES-GCM，密钥由 JWT 密钥派生）
+async function aesKey(c) {
+  const h = await crypto.subtle.digest('SHA-256', enc.encode('nav-backup:' + (await jwtSecret(c))));
+  return crypto.subtle.importKey('raw', h, 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+async function encPw(c, text) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await aesKey(c), enc.encode(text));
+  return `enc1$${b64(iv)}$${bytesB64(ct)}`;
+}
+async function decPw(c, v) {
+  if (!v) return '';
+  if (!v.startsWith('enc1$')) return v;
+  const [, iv, ct] = v.split('$');
+  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(iv) }, await aesKey(c), unb64(ct)));
+}
+
+// ---------- 定时规则（时间一律按北京时间 UTC+8） ----------
+const baseOf = st => Math.max(st.last_attempt || 0, st.anchor || 0);
+function prevSched(now, a) {
+  const [h, m] = a.time.split(':').map(Number), d = bjDate(now);
+  let t = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), h, m) - BJ;
+  if (t > now) t -= DAY;
+  if (a.mode === 'weekly') for (let i = 0; i < 7 && bjDate(t).getUTCDay() !== a.weekday; i++) t -= DAY;
+  return t;
+}
+function isDue(a, st, now) {
+  // 自动备份失败后 30 分钟重试，最多连续 3 次
+  if (st.last_ok === false && st.last_trigger === 'auto' && (st.fails || 0) < 3 && now - (st.last_attempt || 0) >= 30 * 60e3) return true;
+  const base = baseOf(st);
+  if (a.mode === 'interval') return now - base >= a.intervalHours * 3600e3;
+  return base < prevSched(now, a);
+}
+function nextRun(a, st, now) {
+  const base = baseOf(st);
+  if (a.mode === 'interval') return base + a.intervalHours * 3600e3;
+  const p = prevSched(now, a);
+  return base < p ? p : p + (a.mode === 'weekly' ? 7 : 1) * DAY;
+}
+
+// ---------- WebDAV 客户端 ----------
+async function davConf(c, o = {}) {
+  const w = (await getCfg(c)).webdav;
+  const url = String(o.url !== undefined ? o.url : w.url).trim();
+  const username = String(o.username !== undefined ? o.username : w.username);
+  const dir = String(o.dir !== undefined ? o.dir : w.dir);
+  let pw = '';
+  if (o.password) pw = String(o.password);
+  else { try { pw = await decPw(c, w.password); } catch (e) { throw new Error('已保存的 WebDAV 密码无法解密，请重新填写密码并保存'); } }
+  if (!/^https?:\/\//i.test(url)) throw new Error('请先填写 WebDAV 地址（以 http:// 或 https:// 开头）');
+  const segs = dir.replace(/\\/g, '/').split('/').map(s => s.trim()).filter(s => s && s !== '.' && s !== '..');
+  return { base: url.replace(/\/+$/, ''), dirPath: segs.map(encodeURIComponent).join('/'), segs, auth: 'Basic ' + bytesB64(enc.encode(username + ':' + pw)) };
+}
+const davPath = (conf, name) => [conf.dirPath, name && encodeURIComponent(name)].filter(Boolean).join('/');
+async function dav(conf, method, path, opt = {}) {
+  const r = await fetch(conf.base + (path ? '/' + path : ''), { method, body: opt.body, headers: { Authorization: conf.auth, ...(opt.headers || {}) }, signal: AbortSignal.timeout(30000) });
+  if (r.status === 401) { drain(r); throw new Error('WebDAV 认证失败（401），请检查用户名和密码（坚果云等需使用「应用密码」）'); }
+  return r;
+}
+async function davEnsure(conf) {
+  let p = '';
+  for (const s of conf.segs) { p += (p ? '/' : '') + encodeURIComponent(s); drain(await dav(conf, 'MKCOL', p)); }
+}
+async function davPut(conf, name, bytes) {
+  const r = await dav(conf, 'PUT', davPath(conf, name), { body: bytes, headers: { 'Content-Type': 'application/json' } });
+  drain(r);
+  if (![200, 201, 204].includes(r.status)) throw new Error(`WebDAV 上传失败（HTTP ${r.status}${r.status === 507 ? '，空间不足' : r.status === 403 || r.status === 405 ? '，无写入权限或目录不存在' : ''}）`);
+}
+async function davGet(conf, name) {
+  const r = await dav(conf, 'GET', davPath(conf, name));
+  if (!r.ok) { drain(r); throw new Error(`WebDAV 读取失败（HTTP ${r.status}）`); }
+  return r.text();
+}
+async function davDel(conf, name) {
+  const r = await dav(conf, 'DELETE', davPath(conf, name));
+  drain(r);
+  if (![200, 202, 204, 404].includes(r.status)) throw new Error(`WebDAV 删除失败（HTTP ${r.status}）`);
+}
+async function davList(conf) {
+  const r = await dav(conf, 'PROPFIND', davPath(conf), {
+    headers: { Depth: '1', 'Content-Type': 'application/xml' },
+    body: '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>'
+  });
+  if (r.status === 404) { drain(r); return []; }
+  if (r.status !== 207 && !r.ok) { drain(r); throw new Error(`WebDAV 列表失败（HTTP ${r.status}）`); }
+  const xml = await r.text(), items = [];
+  for (const m of xml.matchAll(/<(?:\w+:)?response\b[\s\S]*?<\/(?:\w+:)?response>/gi)) {
+    const blk = m[0];
+    const href = (/<(?:\w+:)?href[^>]*>([\s\S]*?)<\/(?:\w+:)?href>/i.exec(blk) || [])[1] || '';
+    let nm; try { nm = decodeURIComponent(href.trim().replace(/\/+$/, '').split('/').pop()); } catch (e) { continue; }
+    if (!NAME_RE.test(nm)) continue;
+    const size = +((/<(?:\w+:)?getcontentlength[^>]*>\s*(\d+)\s*</i.exec(blk) || [])[1] || 0);
+    const lm = (/<(?:\w+:)?getlastmodified[^>]*>([^<]+)</i.exec(blk) || [])[1];
+    items.push({ name: nm, size, time: lm ? Date.parse(lm) || 0 : 0 });
+  }
+  return items.sort((a, b) => (a.name < b.name ? 1 : -1));
+}
+async function pruneDav(conf, keep) {
+  const l = (await davList(conf)).filter(x => !x.name.includes('pre-restore'));
+  for (const x of l.slice(keep)) await davDel(conf, x.name).catch(() => {});
+}
+
+// ---------- 站内存档（KV，前缀 __backup__/，不会通过 /uploads 对外暴露） ----------
+async function kvList(c) {
+  if (!c.env.KV) throw new Error('未绑定 KV');
+  const r = await c.env.KV.list({ prefix: KVP, limit: 1000 });
+  return r.keys.map(k => ({ name: k.name.slice(KVP.length), size: (k.metadata && k.metadata.size) || 0, time: (k.metadata && k.metadata.time) || 0 }))
+    .filter(x => NAME_RE.test(x.name)).sort((a, b) => (a.name < b.name ? 1 : -1));
+}
+async function pruneKv(c, keep, only) {
+  const l = (await kvList(c)).filter(x => x.name.includes('pre-restore') === !!only);
+  for (const x of l.slice(keep)) await c.env.KV.delete(KVP + x.name).catch(() => {});
+}
+
+// ---------- 生成备份 ----------
+const IMG_KEY = /^[A-Za-z0-9._-]{1,120}$/;
+async function buildBackup(c, { images = false } = {}) {
+  const tables = {
+    menus: await all(c, 'SELECT id, name, "order", password_hash FROM menus ORDER BY id'),
+    sub_menus: await all(c, 'SELECT id, parent_id, name, "order", password_hash FROM sub_menus ORDER BY id'),
+    cards: await all(c, 'SELECT id, menu_id, sub_menu_id, title, url, logo_url, custom_logo_path, "desc", "order" FROM cards ORDER BY id'),
+    ads: await all(c, 'SELECT id, position, img, url FROM ads ORDER BY id'),
+    friends: await all(c, 'SELECT id, title, url, logo FROM friends ORDER BY id')
+  };
+  const wp = await first(c, "SELECT value FROM settings WHERE key='wallpaper'");
+  const ft = await first(c, "SELECT value FROM settings WHERE key='footer'");
+  const out = { type: 'nav-backup', version: 2, created_at: new Date().toISOString(), includes_images: !!images, tables, settings: { wallpaper: wp ? wp.value : null, footer: ft ? ft.value : null } };
+  if (images && c.env.KV) {
+    const keys = new Set();
+    const scan = s => { for (const m of String(s || '').matchAll(/\/uploads\/([A-Za-z0-9._-]{1,120})/g)) keys.add(m[1]); };
+    tables.cards.forEach(x => { if (x.custom_logo_path) keys.add(String(x.custom_logo_path)); scan(x.logo_url); });
+    tables.ads.forEach(x => scan(x.img));
+    tables.friends.forEach(x => scan(x.logo));
+    scan(wp && wp.value);
+    const files = {}; let total = 0, skipped = 0;
+    for (const k of keys) {
+      if (!IMG_KEY.test(k) || k.startsWith('__')) continue;
+      if (Object.keys(files).length >= 60 || total > 25 * 1024 * 1024) { skipped++; continue; }
+      const { value, metadata } = await c.env.KV.getWithMetadata(k, 'arrayBuffer');
+      if (!value) continue;
+      total += value.byteLength;
+      files[k] = { type: (metadata && metadata.type) || MIME[(k.split('.').pop() || '').toLowerCase()] || 'application/octet-stream', data: bytesB64(value) };
+    }
+    out.files = files; out.files_skipped = skipped;
+  }
+  return out;
+}
+
+async function runBackup(c, { targets, images, trigger }) {
+  const keep = (await getCfg(c)).auto.keep;
+  const bytes = enc.encode(JSON.stringify(await buildBackup(c, { images })));
+  const name = `nav-backup-${stampOf(Date.now())}${trigger === 'auto' ? '-auto' : ''}.json`;
+  const results = [];
+  for (const t of targets) {
+    try {
+      if (t === 'webdav') {
+        const conf = await davConf(c);
+        await davEnsure(conf);
+        await davPut(conf, name, bytes);
+        if (keep > 0) await pruneDav(conf, keep).catch(() => {});
+        results.push({ target: 'webdav', ok: true, msg: '成功' });
+      } else if (t === 'kv') {
+        if (!c.env.KV) throw new Error('未绑定 KV');
+        await c.env.KV.put(KVP + name, bytes, { metadata: { size: bytes.length, time: Date.now() } });
+        if (keep > 0) await pruneKv(c, keep).catch(() => {});
+        results.push({ target: 'kv', ok: true, msg: '成功' });
+      }
+    } catch (e) { results.push({ target: t, ok: false, msg: e.message }); }
+  }
+  return { name, size: bytes.length, includes_images: !!images, results, ok: results.length > 0 && results.every(r => r.ok) };
+}
+const TGT = { webdav: 'WebDAV', kv: '站内存档' };
+async function noteRun(c, trigger, out) {
+  const now = Date.now(), st = await getState(c);
+  const msg = out.results.map(r => `${TGT[r.target] || r.target}：${r.ok ? '成功' : r.msg}`).join('；');
+  st.last_attempt = now; st.last_ok = out.ok; st.last_trigger = trigger; st.last_name = out.name; st.last_msg = msg;
+  if (out.ok) { st.last_success = now; st.fails = 0; } else st.fails = (st.fails || 0) + 1;
+  st.history = [{ t: now, trigger, ok: out.ok, name: out.name, size: out.size, msg }, ...(st.history || [])].slice(0, 15);
+  await saveState(c, st);
+}
+
+// 并发锁：同一时刻只允许一个备份/恢复任务（10 分钟后自动过期）
+async function claimLock(c) {
+  const now = Date.now();
+  const r = await run(c, "INSERT INTO settings (key,value) VALUES ('backup_lock',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(settings.value AS INTEGER) < ?", String(now), now - 10 * 60e3);
+  return r.meta.changes > 0;
+}
+const freeLock = c => run(c, "UPDATE settings SET value='0' WHERE key='backup_lock'").catch(() => {});
+
+// ---------- 自动备份调度 ----------
+let lastTick = 0;
+async function autoTick(env, force = false) {
+  const c = { env };
+  const cfg = await getCfg(c);
+  if (!cfg.auto.enabled && !force) return { skipped: 'disabled' };
+  if (!force && !isDue(cfg.auto, await getState(c), Date.now())) return { skipped: 'not-due' };
+  if (!(await claimLock(c))) return { skipped: 'busy' };
+  try {
+    if (!force && !isDue(cfg.auto, await getState(c), Date.now())) return { skipped: 'not-due' };
+    const out = await runBackup(c, { targets: cfg.auto.targets.length ? cfg.auto.targets : ['kv'], images: cfg.auto.includeImages, trigger: 'auto' });
+    await noteRun(c, 'auto', out);
+    return out;
+  } finally { await freeLock(c); }
+}
+// 任意 /api/* 请求结束后，最多每分钟检查一次是否到点（不拖慢响应）
+app.use('/api/*', async (c, next) => {
+  await next();
+  const t = Date.now();
+  if (t - lastTick < 60000 || c.req.path.startsWith('/api/backup')) return;
+  lastTick = t;
+  try { c.executionCtx.waitUntil(autoTick(c.env).catch(() => {})); } catch (e) {}
+});
+
+// ---------- 恢复 ----------
+async function restoreBackup(c, data) {
+  if (!data || data.type !== 'nav-backup' || !data.tables) throw new Error(data && data.type === 'nav-bookmarks' ? '这是「书签导出」文件，请使用顶部的「导入」按钮' : '不是有效的备份文件');
+  const T = data.tables, arr = k => (Array.isArray(T[k]) ? T[k] : []);
+  const stats = { menus: 0, sub_menus: 0, cards: 0, ads: 0, friends: 0, files: 0, skipped: 0 };
+  const menus = [], subs = [], cards = [], ads = [], friends = [], mids = new Set(), sids = new Set();
+  for (const r of arr('menus')) {
+    const id = toInt(r && r.id), name = clip(r && r.name, 100);
+    if (id == null || !name || mids.has(id)) { stats.skipped++; continue; }
+    mids.add(id); menus.push([id, name, toInt(r.order) || 0, str(r.password_hash, 500)]);
+  }
+  for (const r of arr('sub_menus')) {
+    const id = toInt(r && r.id), pid = toInt(r && r.parent_id), name = clip(r && r.name, 100);
+    if (id == null || !name || !mids.has(pid) || sids.has(id)) { stats.skipped++; continue; }
+    sids.add(id); subs.push([id, pid, name, toInt(r.order) || 0, str(r.password_hash, 500)]);
+  }
+  for (const r of arr('cards')) {
+    const id = toInt(r && r.id), mid = toInt(r && r.menu_id), sid = toInt(r && r.sub_menu_id);
+    const title = clip(r && r.title, 200), url = clip(r && r.url, 2000);
+    if (id == null || !title || !url || (mid != null && !mids.has(mid)) || (sid != null && !sids.has(sid)) || (mid == null && sid == null)) { stats.skipped++; continue; }
+    cards.push([id, mid, sid, title, url, clip(r.logo_url, 2000) || null, clip(r.custom_logo_path, 300).replace(/\.\./g, '') || null, clip(r.desc, 500) || null, toInt(r.order) || 0]);
+  }
+  for (const r of arr('ads')) {
+    const id = toInt(r && r.id), pos = clip(r && r.position, 50), img = clip(r && r.img, 2000), url = clip(r && r.url, 2000);
+    if (id == null || !pos || !img || !url) { stats.skipped++; continue; }
+    ads.push([id, pos, img, url]);
+  }
+  for (const r of arr('friends')) {
+    const id = toInt(r && r.id), title = clip(r && r.title, 200), url = clip(r && r.url, 2000);
+    if (id == null || !title || !url) { stats.skipped++; continue; }
+    friends.push([id, title, url, clip(r.logo, 2000) || null]);
+  }
+  // 先把当前数据存一份到站内存档，便于恢复错了回滚
+  if (c.env.KV) {
+    const snap = enc.encode(JSON.stringify(await buildBackup(c, { images: false })));
+    await c.env.KV.put(`${KVP}nav-backup-pre-restore-${stampOf(Date.now())}.json`, snap, { metadata: { size: snap.length, time: Date.now() } });
+    await pruneKv(c, 3, true).catch(() => {});
+  }
+  const S = [stmt(c, 'DELETE FROM cards'), stmt(c, 'DELETE FROM sub_menus'), stmt(c, 'DELETE FROM menus'), stmt(c, 'DELETE FROM ads'), stmt(c, 'DELETE FROM friends')];
+  menus.forEach(p => S.push(stmt(c, 'INSERT INTO menus (id,name,"order",password_hash) VALUES (?,?,?,?)', p)));
+  subs.forEach(p => S.push(stmt(c, 'INSERT INTO sub_menus (id,parent_id,name,"order",password_hash) VALUES (?,?,?,?,?)', p)));
+  cards.forEach(p => S.push(stmt(c, 'INSERT INTO cards (id,menu_id,sub_menu_id,title,url,logo_url,custom_logo_path,"desc","order") VALUES (?,?,?,?,?,?,?,?,?)', p)));
+  ads.forEach(p => S.push(stmt(c, 'INSERT INTO ads (id,position,img,url) VALUES (?,?,?,?)', p)));
+  friends.forEach(p => S.push(stmt(c, 'INSERT INTO friends (id,title,url,logo) VALUES (?,?,?,?)', p)));
+  for (let i = 0; i < S.length; i += 50) await c.env.DB.batch(S.slice(i, i + 50));
+  Object.assign(stats, { menus: menus.length, sub_menus: subs.length, cards: cards.length, ads: ads.length, friends: friends.length });
+  // 图片 → KV
+  if (data.files && typeof data.files === 'object' && c.env.KV) {
+    for (const [k, f] of Object.entries(data.files)) {
+      if (!IMG_KEY.test(k) || k.startsWith('__') || !f || typeof f.data !== 'string' || !IMG.test(String(f.type))) continue;
+      try { await c.env.KV.put(k, unb64(f.data), { metadata: { type: f.type } }); stats.files++; } catch (e) {}
+    }
+  }
+  // 壁纸设置
+  if (data.settings && 'wallpaper' in data.settings) {
+    let w = { url: '', file: '' };
+    try { const p = JSON.parse(data.settings.wallpaper); w = { url: String(p.url || ''), file: String(p.file || '') }; } catch (e) {}
+    if (w.file && c.env.KV && !(await c.env.KV.list({ prefix: w.file, limit: 1 })).keys.some(k => k.name === w.file)) w = { url: '', file: '' };
+    await setWp(c, w);
+  }
+  // 页脚设置
+  if (data.settings && 'footer' in data.settings) {
+    let f = null;
+    try { f = cleanFooter(JSON.parse(data.settings.footer)); } catch (e) {}
+    if (f && !f.error) await run(c, "INSERT INTO settings (key,value) VALUES ('footer',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", JSON.stringify(f));
+  }
+  return stats;
+}
+async function readBackupText(c, source, name) {
+  if (!NAME_RE.test(String(name))) throw new Error('文件名不正确');
+  if (source === 'kv') {
+    if (!c.env.KV) throw new Error('未绑定 KV');
+    const v = await c.env.KV.get(KVP + name);
+    if (v == null) throw new Error('存档不存在');
+    return v;
+  }
+  if (source === 'webdav') return davGet(await davConf(c), name);
+  throw new Error('参数不正确');
+}
+
+// ---------- 接口（均需登录；cron 用专用 token） ----------
+app.get('/api/backup/config', auth, async c => {
+  const cfg = await getCfg(c);
+  if (!cfg.cron_token) { cfg.cron_token = b64url(crypto.getRandomValues(new Uint8Array(24))); await saveCfg(c, cfg); }
+  const st = await getState(c), now = Date.now();
+  const { password, ...w } = cfg.webdav;
+  return c.json({
+    webdav: { ...w, has_password: !!password }, auto: cfg.auto, cron_token: cfg.cron_token, kvBound: !!c.env.KV, now,
+    state: { ...st, next_run: cfg.auto.enabled ? nextRun(cfg.auto, st, now) : null }
+  });
+});
+const b64url = buf => bytesB64(buf).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+app.put('/api/backup/config', auth, async c => {
+  const b = await body(c), cur = await getCfg(c);
+  const next = { cron_token: cur.cron_token, webdav: { ...cur.webdav }, auto: { ...cur.auto } };
+  if (b.webdav) {
+    const w = b.webdav, url = clip(w.url, 300);
+    if (url && !/^https?:\/\//i.test(url)) return c.json({ error: 'WebDAV 地址需以 http:// 或 https:// 开头' }, 400);
+    next.webdav.url = url; next.webdav.username = clip(w.username, 200); next.webdav.dir = clip(w.dir, 200);
+    if (typeof w.password === 'string' && w.password) next.webdav.password = await encPw(c, w.password.slice(0, 200));
+    if (w.clear_password) next.webdav.password = '';
+  }
+  if (b.auto) {
+    const a = b.auto;
+    const mode = ['interval', 'daily', 'weekly'].includes(a.mode) ? a.mode : 'daily';
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(a.time || '03:00'))) return c.json({ error: '时间格式应为 HH:MM（如 03:30）' }, 400);
+    const targets = [...new Set((Array.isArray(a.targets) ? a.targets : []).filter(t => t === 'webdav' || t === 'kv'))];
+    next.auto = {
+      enabled: !!a.enabled, mode, time: String(a.time || '03:00'),
+      intervalHours: Math.min(720, Math.max(1, parseInt(a.intervalHours) || 24)),
+      weekday: Math.min(6, Math.max(0, parseInt(a.weekday) || 0)),
+      targets, includeImages: !!a.includeImages, keep: Math.min(200, Math.max(0, parseInt(a.keep) || 0))
+    };
+    if (next.auto.enabled && !targets.length) return c.json({ error: '请至少选择一个自动备份的保存位置' }, 400);
+    if (next.auto.enabled && targets.includes('webdav') && !next.webdav.url) return c.json({ error: '自动备份选择了 WebDAV，请先填写 WebDAV 地址' }, 400);
+    if (targets.includes('kv') && !c.env.KV) return c.json({ error: '未绑定 KV，无法使用站内存档' }, 400);
+  }
+  if (b.regen_token) next.cron_token = b64url(crypto.getRandomValues(new Uint8Array(24)));
+  await saveCfg(c, next);
+  const st = await getState(c); st.anchor = Date.now(); st.fails = 0; await saveState(c, st); // 改动设置后从此刻重新计时
+  return c.json({ success: true });
+});
+app.post('/api/backup/webdav/test', auth, async c => {
+  try {
+    const conf = await davConf(c, (await body(c)).webdav || {});
+    await davEnsure(conf);
+    const probe = `.nav-backup-test-${Date.now()}.tmp`;
+    await davPut(conf, probe, enc.encode('ok'));
+    await davDel(conf, probe).catch(() => {});
+    return c.json({ success: true, message: '连接成功，目录可写' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 400); }
+});
+app.get('/api/backup/download', auth, async c => {
+  const snap = await buildBackup(c, { images: c.req.query('images') === '1' });
+  return new Response(JSON.stringify(snap), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="nav-backup-${stampOf(Date.now())}.json"`, 'Cache-Control': 'no-store' } });
+});
+app.post('/api/backup/run', auth, async c => {
+  const b = await body(c);
+  const targets = [...new Set((Array.isArray(b.targets) ? b.targets : []).filter(t => t === 'webdav' || t === 'kv'))];
+  if (!targets.length) return c.json({ error: '请选择保存位置' }, 400);
+  if (!(await claimLock(c))) return c.json({ error: '已有备份/恢复任务在进行，请稍后再试' }, 409);
+  try {
+    const out = await runBackup(c, { targets, images: !!b.images, trigger: 'manual' });
+    await noteRun(c, 'manual', out);
+    return c.json(out);
+  } catch (e) { return c.json({ error: e.message }, 500); } finally { await freeLock(c); }
+});
+app.get('/api/backup/list', auth, async c => {
+  try {
+    const s = c.req.query('source');
+    if (s === 'webdav') return c.json({ data: await davList(await davConf(c)) });
+    if (s === 'kv') return c.json({ data: await kvList(c) });
+    return c.json({ error: '参数不正确' }, 400);
+  } catch (e) { return c.json({ error: e.message }, 400); }
+});
+app.get('/api/backup/file', auth, async c => {
+  try {
+    const name = c.req.query('name');
+    const text = await readBackupText(c, c.req.query('source'), name);
+    return new Response(text, { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-store' } });
+  } catch (e) { return c.json({ error: e.message }, 400); }
+});
+app.delete('/api/backup/file', auth, async c => {
+  try {
+    const { source, name } = c.req.query();
+    if (!NAME_RE.test(String(name))) return c.json({ error: '文件名不正确' }, 400);
+    if (source === 'kv') { if (!c.env.KV) throw new Error('未绑定 KV'); await c.env.KV.delete(KVP + name); }
+    else if (source === 'webdav') await davDel(await davConf(c), name);
+    else return c.json({ error: '参数不正确' }, 400);
+    return c.json({ success: true });
+  } catch (e) { return c.json({ error: e.message }, 400); }
+});
+app.post('/api/backup/restore', auth, async c => {
+  const b = await body(c);
+  let text;
+  try { text = b.source === 'upload' ? b.content : await readBackupText(c, b.source, b.name); } catch (e) { return c.json({ error: e.message }, 400); }
+  let data;
+  try { data = JSON.parse(text); } catch (e) { return c.json({ error: '备份文件不是有效的 JSON' }, 400); }
+  if (!(await claimLock(c))) return c.json({ error: '已有备份/恢复任务在进行，请稍后再试' }, 409);
+  try {
+    const stats = await restoreBackup(c, data);
+    await pushHist(c, { trigger: 'restore', ok: true, name: b.source === 'upload' ? '本地文件' : b.name, msg: `恢复：栏目 ${stats.menus}、子栏目 ${stats.sub_menus}、卡片 ${stats.cards}` });
+    return c.json({ success: true, ...stats });
+  } catch (e) { return c.json({ error: '恢复失败：' + e.message + (c.env.KV ? '（恢复前已自动存档当前数据，可在「站内存档」中找到 pre-restore 文件回滚）' : '') }, 500); }
+  finally { await freeLock(c); }
+});
+// 外部定时服务（cron-job.org / UptimeRobot / 另建 Worker Cron）可定时访问：/api/backup/cron?token=xxx（加 &force=1 则立即备份）
+app.all('/api/backup/cron', async c => {
+  const cfg = await getCfg(c), tk = c.req.query('token') || c.req.header('x-cron-token') || '';
+  if (!cfg.cron_token || !safeEq(String(tk), cfg.cron_token)) return c.json({ error: '无效的 token' }, 403);
+  try { return c.json({ success: true, ...(await autoTick(c.env, c.req.query('force') === '1')) }); }
+  catch (e) { return c.json({ error: e.message }, 500); }
 });
 
 export default app;
