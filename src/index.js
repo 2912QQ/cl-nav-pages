@@ -48,6 +48,99 @@ function ensure(env) {
 }
 app.use('/api/*', async (c, next) => { await ensure(c.env); await next(); });
 
+// ---------- 操作日志（谁、什么时间、什么 IP、改了什么） ----------
+let auditReady = null;
+const ensureAudit = env => auditReady || (auditReady = env.DB.batch([
+  env.DB.prepare('CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, username TEXT, ip TEXT, action TEXT NOT NULL, detail TEXT)'),
+  env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts)')
+]).catch(e => { auditReady = null; throw e; }));
+const clientIp = c => c.req.header('cf-connecting-ip') || (c.req.header('x-forwarded-for') || '').split(',')[0].trim() || '';
+const AUDIT_TABLES = { cards: ['卡片', 'cards', 'title'], menus: ['分类', 'menus', 'name'], submenus: ['子分类', 'sub_menus', 'name'], ads: ['广告', 'ads', 'url'], friends: ['友链', 'friends', 'title'] };
+const AUDIT_FIELDS = { menu_id: '所属分类ID', sub_menu_id: '子分类ID', parent_id: '父分类ID', title: '标题', name: '名称', url: '链接', logo_url: '图标', logo: '图标', img: '图片', desc: '描述', order: '排序', position: '位置', text: '版权文字', link_text: '链接文字', admin_text: '后台版权文字', admin_link_text: '后台链接文字', admin_url: '后台链接' };
+const aclip = (v, n = 80) => { v = v == null ? '' : String(v); return v.length > n ? v.slice(0, n) + '…' : v; };
+const diffFields = (o, nw) => {
+  const out = [];
+  for (const k of Object.keys(AUDIT_FIELDS)) {
+    if (!(k in nw) || !(k in o)) continue;
+    const a = o[k] == null ? '' : String(o[k]), b = nw[k] == null ? '' : String(nw[k]);
+    if (a !== b) out.push(`${AUDIT_FIELDS[k]}：${aclip(a) || '（空）'} → ${aclip(b) || '（空）'}`);
+  }
+  return out;
+};
+// 解析接口 → { action, table?, id? }
+function auditRoute(method, path) {
+  let m;
+  if (method === 'POST' && path === '/api/login') return { action: '登录' };
+  if (path === '/api/users/password') return { action: '修改登录密码' };
+  if ((m = /^\/api\/menus\/submenus\/(\d+)\/password$/.exec(path))) return { action: '设置/清除子分类密码', table: 'submenus', id: m[1] };
+  if ((m = /^\/api\/menus\/(\d+)\/password$/.exec(path))) return { action: '设置/清除分类密码', table: 'menus', id: m[1] };
+  if ((m = /^\/api\/menus\/(\d+)\/submenus$/.exec(path)) && method === 'POST') return { action: '新增子分类', table: 'submenus', parent: m[1] };
+  if ((m = /^\/api\/(cards|menus|ads|friends)(?:\/(\d+))?$/.exec(path)) || (m = /^\/api\/menus\/(submenus)\/(\d+)$/.exec(path))) {
+    const t = AUDIT_TABLES[m[1]], v = { POST: '新增', PUT: '修改', DELETE: '删除' }[method];
+    if (v) return { action: v + t[0], table: m[1], id: m[2] };
+  }
+  if (path === '/api/footer') return { action: method === 'DELETE' ? '恢复默认页脚' : '修改页脚', footer: true };
+  if (path === '/api/wallpaper/url') return { action: '修改壁纸（URL）' };
+  if (path === '/api/wallpaper/upload') return { action: '上传壁纸' };
+  if (path === '/api/wallpaper' && method === 'DELETE') return { action: '恢复默认壁纸' };
+  if (path === '/api/upload') return { action: '上传图片' };
+  if (path === '/api/bookmarks/import') return { action: '导入书签/数据' };
+  if (path === '/api/backup/config') return { action: '修改备份设置' };
+  if (path === '/api/backup/run') return { action: '立即备份' };
+  if (path === '/api/backup/restore') return { action: '恢复备份' };
+  if (path === '/api/backup/file' && method === 'DELETE') return { action: '删除备份文件' };
+  if (path === '/api/backup/webdav/test') return { action: '测试 WebDAV 连接' };
+  if (path === '/api/logs' && method === 'DELETE') return { action: '清空操作日志' };
+  return { action: method + ' ' + path };
+}
+app.use('/api/*', async (c, next) => {
+  const method = c.req.method;
+  const path = new URL(c.req.url).pathname;
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS' || path.startsWith('/api/backup/cron') || path === '/api/menus/verify-password') return next();
+  const info = auditRoute(method, path);
+  let nw = null, old = null;
+  const big = path === '/api/backup/restore' || path === '/api/bookmarks/import';
+  try {
+    if (!big && (c.req.header('content-type') || '').includes('json')) nw = await c.req.raw.clone().json();
+    if (nw && typeof nw !== 'object') nw = null;
+    if (info.footer) old = await getFooter(c);
+    else if (info.table && info.id && (method === 'PUT' || method === 'DELETE') && !path.endsWith('/password')) {
+      await ensureAudit(c.env);
+      old = await first(c, `SELECT * FROM ${AUDIT_TABLES[info.table][1]} WHERE id=?`, info.id);
+    }
+  } catch (e) {}
+  await next();
+  try {
+    const status = c.res.status;
+    const isLogin = path === '/api/login';
+    if (status >= 400 && !isLogin) return;
+    const u = c.get('user');
+    let username = u && u.username ? u.username : '';
+    let action = info.action, detail = '';
+    if (isLogin) { username = aclip(nw && nw.username, 60); if (status >= 400) action = '登录失败'; }
+    else if (info.table) {
+      const t = AUDIT_TABLES[info.table];
+      const label = (old && old[t[2]]) || (nw && nw[t[2]]) || '';
+      const parts = [];
+      if (info.id) parts.push(`${t[0]} #${info.id}`);
+      if (label) parts.push(`「${aclip(label, 60)}」`);
+      if (info.parent) parts.push(`父分类 #${info.parent}`);
+      detail = parts.join(' ');
+      if (method === 'PUT' && old && nw && !path.endsWith('/password')) { const d = diffFields(old, nw); detail += d.length ? '；' + d.join('；') : '；无字段变化'; }
+      else if (method === 'POST' && nw) detail += (detail ? '；' : '') + diffFields({ ...Object.fromEntries(Object.keys(AUDIT_FIELDS).map(k => [k, ''])) }, nw).join('；');
+      else if (method === 'DELETE' && old) detail += '；' + Object.keys(AUDIT_FIELDS).filter(k => k in old && old[k] != null && old[k] !== '').slice(0, 4).map(k => `${AUDIT_FIELDS[k]}：${aclip(old[k], 60)}`).join('；');
+    } else if (info.footer) {
+      if (method === 'PUT' && old && nw) { const d = diffFields(old, nw); detail = d.length ? d.join('；') : '无字段变化'; }
+    } else if (path === '/api/wallpaper/url' && nw) detail = aclip(nw.url, 200);
+    else if (path === '/api/backup/restore' && nw) detail = '来源：' + aclip(nw.source, 20) + (nw.name ? ' / ' + aclip(nw.name, 60) : '');
+    await ensureAudit(c.env);
+    const task = run(c, 'INSERT INTO audit_logs (ts,username,ip,action,detail) VALUES (?,?,?,?,?)', Date.now(), username, clientIp(c), action, aclip(detail, 600))
+      .then(() => { if (Math.random() < 0.02) return run(c, 'DELETE FROM audit_logs WHERE id <= (SELECT MAX(id) FROM audit_logs) - 5000'); })
+      .catch(() => {});
+    try { c.executionCtx.waitUntil(task); } catch (e) { await task; }
+  } catch (e) {}
+});
+
 // JWT 密钥：优先用环境变量 JWT_SECRET；没设置则自动生成并保存在数据库里
 let genSecret = null;
 async function jwtSecret(c) {
@@ -349,15 +442,34 @@ app.delete('/api/wallpaper', auth, async c => {
   return c.json({ url: '' });
 });
 
+// ---------- 操作日志查询 / 清空 ----------
+app.get('/api/logs', auth, async c => {
+  await ensureAudit(c.env);
+  const page = Math.max(1, parseInt(c.req.query('page')) || 1);
+  const size = Math.min(100, Math.max(1, parseInt(c.req.query('pageSize')) || 20));
+  const q = (c.req.query('q') || '').trim().slice(0, 60);
+  const like = '%' + q.replace(/[\\%_]/g, m => '\\' + m) + '%';
+  const where = q ? " WHERE (username LIKE ? ESCAPE '\\' OR ip LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\')" : '';
+  const args = q ? [like, like, like, like] : [];
+  const total = (await first(c, 'SELECT COUNT(*) AS total FROM audit_logs' + where, ...args)).total;
+  const data = await all(c, 'SELECT id, ts, username, ip, action, detail FROM audit_logs' + where + ' ORDER BY id DESC LIMIT ? OFFSET ?', ...args, size, (page - 1) * size);
+  return c.json({ total, page, pageSize: size, data });
+});
+app.delete('/api/logs', auth, async c => {
+  await ensureAudit(c.env);
+  await run(c, 'DELETE FROM audit_logs');
+  return c.json({ success: true });
+});
+
 // ---------- 页脚版权（文字 + 链接，可在后台自定义） ----------
-const FOOTER_DEFAULT = { text: 'Copyright © 2026  |   ', link_text: '龍哥博客', url: 'https://bk0.at8.ccwu.cc/' };
+const FOOTER_DEFAULT = { text: 'Copyright © 2026  |   ', link_text: '龍哥博客', url: 'https://bk0.at8.ccwu.cc/', admin_text: 'Copyright © 2025 Nav-Item | ', admin_link_text: 'Powered by eooce', admin_url: 'https://github.com/eooce/Nav-Item' };
+const badUrl = u => u && (!/^https?:\/\//i.test(u) || u.length > 500 || /[\s"'<>\\]/.test(u));
 const cleanFooter = v => {
   v = v && typeof v === 'object' ? v : {};
-  const text = String(v.text == null ? '' : v.text).slice(0, 200);
-  const link_text = String(v.link_text == null ? '' : v.link_text).trim().slice(0, 100);
-  const url = String(v.url == null ? '' : v.url).trim();
-  if (url && (!/^https?:\/\//i.test(url) || url.length > 500 || /[\s"'<>\\]/.test(url))) return { error: '链接 URL 无效（需 http:// 或 https:// 开头，且不能含空格、引号、尖括号）' };
-  return { text, link_text, url };
+  const pick = (k, max, trim) => { let x = v[k] == null ? (k.startsWith('admin_') ? FOOTER_DEFAULT[k] : '') : String(v[k]); if (trim) x = x.trim(); return x.slice(0, max); };
+  const out = { text: pick('text', 200), link_text: pick('link_text', 100, 1), url: pick('url', 600, 1), admin_text: pick('admin_text', 200), admin_link_text: pick('admin_link_text', 100, 1), admin_url: pick('admin_url', 600, 1) };
+  if (badUrl(out.url) || badUrl(out.admin_url)) return { error: '链接 URL 无效（需 http:// 或 https:// 开头，不超过 500 字，且不能含空格、引号、尖括号）' };
+  return out;
 };
 async function getFooter(c) {
   try { const r = await first(c, "SELECT value FROM settings WHERE key='footer'"); if (r && r.value) { const f = cleanFooter(JSON.parse(r.value)); if (!f.error) return f; } } catch (e) {}
